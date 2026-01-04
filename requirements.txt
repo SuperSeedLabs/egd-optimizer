@@ -20,9 +20,9 @@ sentence-transformers==3.4.0
 # Hugging Face ecosystem
 datasets==3.2.0
 huggingface-hub==0.27.1
-# bitsandbytes==0.45.4
+bitsandbytes==0.45.4
 accelerate==1.6.0
-# deepspeed==0.14.4
+deepspeed==0.14.4
 
 # Visualization
 matplotlib==3.9.1
@@ -36,9 +36,6 @@ pymongo==4.11.1
 redis==5.2.1
 SQLAlchemy==2.0.37
 
-# Distributed computing
-ray[data,train,tune,serve]
-
 # Other
-python-dotenv 
+python-dotenv
 arxiv

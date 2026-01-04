@@ -5,8 +5,7 @@ import asyncio
 import math
 import random
 import time
-from typing import Tuple, List, Optional, Dict, Any, Type
-import json
+from typing import Tuple, List, Optional
 
 import numpy as np
 import torch
@@ -17,23 +16,12 @@ from torch.utils.data import Dataset
 from transformers import GPT2Tokenizer
 
 from agent.egd.egd import EGD
-from agent.egd.egd_registry import register_module, ModuleConfig, MODULE_REGISTRY
+from agent.egd.egd_registry import register_module, ModuleConfig
 from agent.egd.utils import print_elapsed_time
-# Import the new generation function
-from llm_module_generator import generate_validated_modules_parallel
-# Import helper modules from the new file
-from agent.egd.egd_modules import MultiHeadAttention, FeedForward, TransformerDecoderLayer
 
 # Force using a single GPU for training to avoid NCCL errors
-# os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use only the first GPU
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # Use only the first GPU
 
-# TODO: dedup the generated modules so that we are not registering the same module multiple times
-# TODO: rigorously benchmark on a smaller dataset that is not saturated with existing models
-# TODO: ensure the modules are not just correct but also registered correctly on the registry
-
-# Function to generate and register modules using OpenAI
-# MOVED to llm_module_generator.py
-# def generate_and_register_module(...): ...
 
 # Define the TransformerLanguageModel class for BabyLM
 @register_module('babylm_gpt2')
@@ -56,16 +44,16 @@ class TransformerLM(nn.Module):
     def __init__(self, **kwargs):
         super().__init__()
 
-        # Get required parameters with defaults, ensuring int type for dimensions
-        self.vocab_size = int(kwargs.get('vocab_size', 50257))
-        self.d_model = int(kwargs.get('d_model', 256))
-        self.num_heads = int(kwargs.get('num_heads', 4))
-        self.num_layers = int(kwargs.get('num_layers', 4))
-        self.d_ff = int(kwargs.get('d_ff', 4 * self.d_model))
-        self.max_seq_len = int(kwargs.get('max_seq_len', 128)) # Cast max_seq_len to int
-        self.dropout_rate = float(kwargs.get('dropout', 0.1)) # Keep dropout as float
+        # Get required parameters with defaults
+        self.vocab_size = kwargs.get('vocab_size', 50257)  # Default GPT2 vocab size
+        self.d_model = kwargs.get('d_model', 256)  # Embedding dimension (reduced from 384)
+        self.num_heads = kwargs.get('num_heads', 4)  # Number of attention heads (reduced from 6)
+        self.num_layers = kwargs.get('num_layers', 4)  # Number of transformer layers (reduced from 6)
+        self.d_ff = kwargs.get('d_ff', 4 * self.d_model)  # Feed-forward dimension
+        self.max_seq_len = kwargs.get('max_seq_len', 128)  # Context window size
+        self.dropout_rate = kwargs.get('dropout', 0.1)  # Dropout probability
 
-        # Store the block size (already an int from max_seq_len)
+        # Store the block size
         self.block_size = self.max_seq_len
 
         # Initialize embeddings
@@ -90,7 +78,6 @@ class TransformerLM(nn.Module):
 
     def _create_transformer_layer(self):
         """Create a single transformer decoder layer"""
-        # Now uses the imported TransformerDecoderLayer
         return TransformerDecoderLayer(
             d_model=self.d_model,
             num_heads=self.num_heads,
@@ -114,7 +101,7 @@ class TransformerLM(nn.Module):
         # Ensure both the model and input are on the same device
         device = next(self.parameters()).device
         x = x.to(device)
-
+        
         seq_len = x.size(1)
 
         # Token embeddings + positional embeddings
@@ -137,7 +124,7 @@ class TransformerLM(nn.Module):
         self.eval()
         device = next(self.parameters()).device
         idx = idx.to(device)
-
+        
         with torch.no_grad():
             for _ in range(max_new_tokens):
                 # Crop idx to block_size tokens if needed
@@ -178,15 +165,97 @@ class TransformerLM(nn.Module):
 
 
 # Define helper classes for the transformer model
-# MOVED to agent/egd/egd_modules.py
-# @register_module('multi_head_attention')
-# class MultiHeadAttention(nn.Module): ...
-#
-# @register_module('feed_forward')
-# class FeedForward(nn.Module): ...
-#
-# @register_module('transformer_decoder_layer')
-# class TransformerDecoderLayer(nn.Module): ...
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads, block_size, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        assert self.head_dim * num_heads == d_model, "d_model must be divisible by num_heads"
+
+        # Linear projections
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Register buffer for causal attention mask (decoder-only)
+        self.register_buffer(
+            "causal_mask",
+            torch.triu(torch.ones(block_size, block_size), diagonal=1).bool()
+        )
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+
+        # Linear projections and reshape
+        q = self.q_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Apply causal mask (mask out future positions)
+        scores = scores.masked_fill(self.causal_mask[:seq_len, :seq_len], float('-inf'))
+
+        # Apply softmax and dropout
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Apply attention weights to values
+        attn_output = torch.matmul(attn_weights, v)
+
+        # Reshape output
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
+
+        # Final linear projection
+        out = self.out_proj(attn_output)
+
+        return out
+
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0.1):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = F.gelu(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return x
+
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, d_model, num_heads, d_ff, block_size, dropout=0.1):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(d_model, num_heads, block_size, dropout)
+        self.feed_forward = FeedForward(d_model, d_ff, dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        # Self-attention with residual connection
+        attn_output = self.self_attn(x)
+        x = x + self.dropout1(attn_output)
+        x = self.norm1(x)
+
+        # Feed forward with residual connection
+        ff_output = self.feed_forward(x)
+        x = x + self.dropout2(ff_output)
+        x = self.norm2(x)
+
+        return x
+
 
 # Define a dataset class for BabyLM
 class TextDataset(Dataset):
@@ -418,101 +487,118 @@ class LanguageModelLoss(nn.Module):
         return self.criterion(outputs, targets)
 
 
-# --- Helper to get TransformerLM source code for the prompt ---
-import inspect
-try:
-    TRANSFORMER_LM_SOURCE = inspect.getsource(TransformerLM)
-    # Optionally simplify the source code for the prompt (e.g., remove comments, shorten docstrings)
-    # This basic version just takes the whole source.
-except Exception as e:
-    print(f"Warning: Could not get source code for TransformerLM. Using placeholder. Error: {e}")
-    TRANSFORMER_LM_SOURCE = """
-    class TransformerLM(nn.Module):
-        # ... (Structure including __init__ with **kwargs, forward, generate) ...
-        pass
-    """
-# --- End Helper ---
-
-
 def main():
     '''Main function to test EGD with BabyLM dataset'''
+
+    # Skip the database section entirely
     print("\n=== Running babylm evaluation with EGD framework ===\n")
-
-    # === Configuration ===
-    NUM_GENERATED_MODULES = 250 # Parameter to control how many novel modules to generate
-    MAX_CORRECTION_ATTEMPTS = 10 # How many times the LLM can try to fix its own code
-    # === End Configuration ===
-
-    # === Generate custom novel modules using LLM (Now Parallel & Validated) ===
-    print(f"\n--- Generating {NUM_GENERATED_MODULES} Novel Modules via LLM (Parallel & Validated) ---")
-    generated_modules_config = [] # Initialize empty list
-
-    if not TRANSFORMER_LM_SOURCE:
-        print("ERROR: Cannot proceed without TransformerLM source code for the prompt.")
-        return
-
-    # Run the parallel generation function
-    # Need to run this within an asyncio event loop
-    try:
-        generated_modules_config = asyncio.run(
-            generate_validated_modules_parallel(
-                num_modules=NUM_GENERATED_MODULES,
-                existing_transformer_example=TRANSFORMER_LM_SOURCE,
-                max_correction_attempts=MAX_CORRECTION_ATTEMPTS
-            )
-        )
-    except Exception as e:
-        print(f"Error during parallel module generation: {e}")
-        import traceback
-        traceback.print_exc()
-        # Decide if you want to continue with only base modules or exit
-        print("Continuing without generated modules due to error.")
-        generated_modules_config = []
-
-
-    print("\n--- Finished Generating Novel Modules --- ")
-    if not generated_modules_config:
-         print(f"Warning: No novel modules were successfully generated and validated (0/{NUM_GENERATED_MODULES} requested).")
-    else:
-        print(f"Successfully generated and validated {len(generated_modules_config)} / {NUM_GENERATED_MODULES} novel modules:")
-        for config in generated_modules_config:
-            print(f"- {config.module_type} (Kwargs: {config.kwargs})")
-    # === End Generation ===
-
-
-    # Define the base configurations (non-generated)
-    base_module_options = [
-        [ModuleConfig(module_type='babylm_gpt2', kwargs={'vocab_size': 50257, 'd_model': 512, 'num_heads': 8, 'num_layers': 4, 'max_seq_len': 1024, 'dropout': 0.1})],
-        [ModuleConfig(module_type='babylm_gpt2', kwargs={'vocab_size': 50257, 'd_model': 768, 'num_heads': 12, 'num_layers': 6, 'max_seq_len': 1024, 'dropout': 0.1})],
-        [ModuleConfig(module_type='babylm_gpt2', kwargs={'vocab_size': 50257, 'd_model': 1024, 'num_heads': 16, 'num_layers': 8, 'max_seq_len': 1024, 'dropout': 0.1})],
-        # [ModuleConfig(module_type='babylm_gpt2', kwargs={'vocab_size': 50257, 'd_model': 768, 'num_heads': 12, 'num_layers': 6, 'max_seq_len': 1024, 'dropout': 0.05})],
-        # [ModuleConfig(module_type='babylm_gpt2', kwargs={'vocab_size': 50257, 'd_model': 768, 'num_heads': 12, 'num_layers': 6, 'max_seq_len': 1024, 'dropout': 0.2})],
-        # [ModuleConfig(module_type='babylm_gpt2', kwargs={'vocab_size': 50257, 'd_model': 768, 'num_heads': 8, 'num_layers': 8, 'max_seq_len': 1024, 'dropout': 0.1})],
-        # [ModuleConfig(module_type='babylm_gpt2', kwargs={'vocab_size': 50257, 'd_model': 768, 'num_heads': 16, 'num_layers': 4, 'max_seq_len': 1024, 'dropout': 0.1})],
-    ]
-
-    # Combine base options with generated options
-    all_layer_options = base_module_options + [[config] for config in generated_modules_config]
 
     # Use the updated config from above
     meta_config = {
-        'LAYERS_CONFIG_INIT': [ # Keep the initial config simple
+        'LAYERS_CONFIG_INIT': [
             ModuleConfig(
                 module_type='babylm_gpt2',
                 kwargs={
-                    'vocab_size': 50257,
-                    'd_model': 768,
-                    'num_heads': 12,
-                    'num_layers': 6,
-                    'max_seq_len': 1024,
+                    'vocab_size': 50257,  # Same as babylm.py
+                    'd_model': 768,  # Match EMBED_DIM from babylm.py
+                    'num_heads': 12,  # Match N_HEAD from babylm.py 
+                    'num_layers': 6,  # Match N_LAYER from babylm.py
+                    'max_seq_len': 1024,  # Match CONTEXT_L from babylm.py
                     'dropout': 0.1
                 }
             )
         ],
-        'LAYERS_CONFIG_OPTIONS': all_layer_options, # Use the combined list
-        'POPULATION_SIZE': 10, # Maybe increase slightly to explore novel modules
-        'GENERATIONS': 5,     # Maybe increase slightly
-        'EPOCHS': 10,
+        'LAYERS_CONFIG_OPTIONS': [[
+            # Varying embedding dimensions
+            ModuleConfig(
+                module_type='babylm_gpt2',
+                kwargs={
+                    'vocab_size': 50257,
+                    'd_model': 512,  # Smaller model
+                    'num_heads': 8,
+                    'num_layers': 4,
+                    'max_seq_len': 1024,
+                    'dropout': 0.1
+                }
+            )],
+            [
+                ModuleConfig(
+                    module_type='babylm_gpt2',
+                    kwargs={
+                        'vocab_size': 50257,
+                        'd_model': 768,  # Standard model
+                        'num_heads': 12,
+                        'num_layers': 6,
+                        'max_seq_len': 1024,
+                        'dropout': 0.1
+                    }
+                )],
+            [
+                ModuleConfig(
+                    module_type='babylm_gpt2',
+                    kwargs={
+                        'vocab_size': 50257,
+                        'd_model': 1024,  # Larger model
+                        'num_heads': 16,
+                        'num_layers': 8,
+                        'max_seq_len': 1024,
+                        'dropout': 0.1
+                    }
+                )],
+            [
+                # Varying dropout rates
+                ModuleConfig(
+                    module_type='babylm_gpt2',
+                    kwargs={
+                        'vocab_size': 50257,
+                        'd_model': 768,
+                        'num_heads': 12,
+                        'num_layers': 6,
+                        'max_seq_len': 1024,
+                        'dropout': 0.05  # Lower dropout
+                    }
+                )],
+            [
+                ModuleConfig(
+                    module_type='babylm_gpt2',
+                    kwargs={
+                        'vocab_size': 50257,
+                        'd_model': 768,
+                        'num_heads': 12,
+                        'num_layers': 6,
+                        'max_seq_len': 1024,
+                        'dropout': 0.2  # Higher dropout
+                    }
+                )],
+            [
+                # Different layer/head combinations
+                ModuleConfig(
+                    module_type='babylm_gpt2',
+                    kwargs={
+                        'vocab_size': 50257,
+                        'd_model': 768,
+                        'num_heads': 8,  # Fewer heads
+                        'num_layers': 8,  # More layers
+                        'max_seq_len': 1024,
+                        'dropout': 0.1
+                    }
+                )],
+            [
+                ModuleConfig(
+                    module_type='babylm_gpt2',
+                    kwargs={
+                        'vocab_size': 50257,
+                        'd_model': 768,
+                        'num_heads': 16,  # More heads
+                        'num_layers': 4,  # Fewer layers
+                        'max_seq_len': 1024,
+                        'dropout': 0.1
+                    }
+                )],
+        ],
+        'POPULATION_SIZE': 25,  # Use 100 models in population
+        'GENERATIONS': 10,  # Run for 50 generations
+        'EPOCHS': 25,  # Train each model for 100 epochs per generation
         'DEBUG': True,
         'BATCH_SIZE_INIT': 16,  # Initial batch size
         'BATCH_SIZE_OPTIONS': [(4, 128), 8, 32],  # Range of batch sizes
@@ -532,16 +618,11 @@ def main():
 
     # Load BabyLM data with reduced percentage for training
     block_size = 1024  # Match the model's max_seq_len
-    train_data_percent = 0.01 # Use only 1% for faster iterations during dev
+    train_data_percent = 0.01  # Use 10% of the data for training
     (training_data, validation_data, _) = load_babylm(
         block_size=block_size,
         data_percent=train_data_percent
     )
-
-    # Check if we actually loaded data
-    if not training_data or not validation_data:
-         print("ERROR: No training or validation data loaded. Exiting.")
-         return # Exit if data loading failed
 
     # Initialize EGD
     egd = EGD(
@@ -553,15 +634,15 @@ def main():
     )
 
     # Set log path
-    egd.log_path = f'logs/babylm_eval_llm_named_{NUM_GENERATED_MODULES}_modules.csv' # Updated log file name
+    egd.log_path = f'logs/babylm_evaluation.csv'
 
-    print('\nRunning the evaluation training with LLM-named novel modules\n')
+    print('\nRunning the evaluation training\n')
 
     # Start timing
     start_time = time.time()
 
     # Train with EGD
-    best_net_obj, most_acc_obj = asyncio.run(egd.train())
+    best_net, most_acc = asyncio.run(egd.train())
 
     # End timing
     end_time = time.time()
@@ -569,135 +650,67 @@ def main():
 
     print_elapsed_time(training_time)
 
-    # --- Print Best Network Architecture ---
-    if best_net_obj is None:
-        print("\nERROR: EGD training did not return a best network.")
-    else:
-        print("\n=== Best Network Found ===")
-        # Retrieve the full best tuple (network, perf, acc, hparams)
-        best_tuple = egd.get_best()
-        if best_tuple:
-            best_net, best_perf, best_acc, best_hyperparams = best_tuple
-
-            print(f"Net ID: {best_net.net_id}")
-            print(f"Performance (Fitness): {best_perf:.4f}")
-            print(f"Validation Accuracy/Score: {best_acc:.4f}") # Note: Accuracy might be 100-loss based on eval_net_perf hack
-
-            print("\nHyperparameters:")
-            # Print relevant hyperparameters neatly
-            print(f"  Learning Rate: {best_hyperparams.get('LEARNING_RATE', 'N/A'):.6f}")
-            print(f"  Momentum: {best_hyperparams.get('MOMENTUM', 'N/A'):.4f}")
-            print(f"  Weight Decay: {best_hyperparams.get('WEIGHT_DECAY', 'N/A'):.6f}")
-            print(f"  Dropout: {best_hyperparams.get('DROPOUT', 'N/A'):.4f}")
-            print(f"  Batch Size Config: {best_hyperparams.get('BATCH_SIZE', 'N/A')}")
-            optimizer_class = best_hyperparams.get('OPTIMIZER')
-            print(f"  Optimizer: {optimizer_class.__name__ if optimizer_class else 'N/A'}")
-
-            print("\nLayers Config (Architecture Definition):")
-            layers_config = best_hyperparams.get('LAYERS_CONFIG', [])
-            if layers_config:
-                for i, layer_conf in enumerate(layers_config):
-                    print(f"  Layer {i}:")
-                    print(f"    Type: {layer_conf.module_type}")
-                    print(f"    Kwargs: {layer_conf.kwargs}")
-            else:
-                print("  No layer configuration found.")
-
-            print("\nModel Structure (PyTorch Representation):")
-            print(best_net.model) # Print the nn.Module structure
-
-            # Ensure n_params exists before printing
-            if hasattr(best_net, 'n_params'):
-                 print(f'\nNumber of parameters in best model: {best_net.n_params}\n')
-            else:
-                 print("\nCould not determine number of parameters in the best model.")
-
-        else:
-            print("Could not retrieve best network details from EGD object.")
-    # --- End Print Best Network Architecture ---
-
-
-    # Check if training produced a valid model before evaluation
-    if best_net_obj is None:
-        print("Skipping final evaluation as no best network was found.")
-        return # Exit if no best network
-
-
     # Load full validation and test data for complete evaluation
-    test_data_percent = 0.2 # Use 20% of data for final eval
+    test_data_percent = 0.2 # Use 100% of data for testing
     print(f'\nLoading {test_data_percent*100}% of validation and test data for final evaluation\n')
     (_, full_validation_data, full_test_data) = load_babylm(
         block_size=block_size,
         data_percent=test_data_percent
     )
 
-    # Check if final evaluation data loaded
-    if not full_validation_data or not full_test_data:
-        print("ERROR: Could not load full validation/test data for final evaluation. Skipping.")
-    else:
-        # Test on the full validation data
-        print(f'\nEvaluating the trained model on {test_data_percent*100}% validation data...\n')
-        val_loss, _ = egd.test_net(best_net_obj, full_validation_data)
-        val_perplexity = math.exp(val_loss) if val_loss is not None and val_loss != float('inf') else float('inf')
-        print(f'\nValidation loss: {val_loss:.4f}, Perplexity: {val_perplexity:.2f}\n')
-
-        # Test on the full test data
-        print(f'\nEvaluating the trained model on {test_data_percent*100}% test data...\n')
-        test_loss, _ = egd.test_net(best_net_obj, full_test_data)
-        test_perplexity = math.exp(test_loss) if test_loss is not None and test_loss != float('inf') else float('inf')
-        print(f'\nTest loss: {test_loss:.4f}, Perplexity: {test_perplexity:.2f}\n')
-
+    # Test on the full validation data
+    print(f'\nEvaluating the trained model on {test_data_percent*100}% validation data...\n')
+    val_loss, _ = egd.test_net(best_net, full_validation_data)
+    val_perplexity = math.exp(val_loss)
+    print(f'\nValidation loss: {val_loss:.4f}, Perplexity: {val_perplexity:.2f}\n')
+    
+    # Test on the full test data
+    print(f'\nEvaluating the trained model on {test_data_percent*100}% test data...\n')
+    test_loss, _ = egd.test_net(best_net, full_test_data)
+    test_perplexity = math.exp(test_loss)
+    print(f'\nTest loss: {test_loss:.4f}, Perplexity: {test_perplexity:.2f}\n')
+    print(f'Number of parameters: {best_net.n_params}\n')
 
     # Generate some sample text with the model
     print("\n=== Sample Text Generation ===\n")
-    # Ensure generate method exists
-    if hasattr(best_net_obj, 'generate') and callable(best_net_obj.generate):
-        device = next(best_net_obj.parameters()).device
+    device = next(best_net.parameters()).device
 
-        # Sample prompts
-        prompts = [
-            "Once upon a time",
-            "The quick brown fox",
-            "In a galaxy far away",
-        ]
+    # Sample prompts
+    prompts = [
+        "Once upon a time",
+        "The quick brown fox",
+        "In a galaxy far away",
+    ]
 
-        # Initialize tokenizer
-        tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+    # Initialize tokenizer
+    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-        for prompt in prompts:
-            print(f"\n{'=' * 50}")
-            print(f"PROMPT: {prompt}")
-            print(f"{'=' * 50}")
+    for prompt in prompts:
+        print(f"\n{'=' * 50}")
+        print(f"PROMPT: {prompt}")
+        print(f"{'=' * 50}")
 
-            try:
-                # Tokenize prompt
-                input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+        # Tokenize prompt
+        input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
-                # Generate continuation with direct values
-                output_ids = best_net_obj.generate(
-                    idx=input_ids,
-                    max_new_tokens=100,
-                    temperature=0.8,
-                    top_p=0.9,
-                )
+        # Generate continuation with direct values
+        output_ids = best_net.generate(
+            input_ids,
+            max_new_tokens=100,  # MAX_GEN_LENGTH value
+            temperature=0.8,     # GEN_TEMPERATURE value
+            top_p=0.9,           # GEN_TOP_P value
+        )
 
-                # Calculate the length of input to separate the generated part
-                input_length = len(tokenizer.encode(prompt))
-                continuation = tokenizer.decode(output_ids[0][input_length:], skip_special_tokens=True)
+        # Calculate the length of input to separate the generated part
+        input_length = len(tokenizer.encode(prompt))
+        continuation = tokenizer.decode(output_ids[0][input_length:], skip_special_tokens=True)
 
-                print(f"\nGENERATED CONTINUATION:")
-                print(f"{'-' * 50}")
-                print(continuation)
-                print(f"{'-' * 50}")
-            except Exception as e:
-                print(f"Error during text generation for prompt '{prompt}': {e}")
-                import traceback
-                traceback.print_exc()
-
-    else:
-        print("Best model does not have a 'generate' method. Skipping text generation.")
+        print(f"\nGENERATED CONTINUATION:")
+        print(f"{'-' * 50}")
+        print(continuation)
+        print(f"{'-' * 50}")
 
 
 if __name__ == '__main__':

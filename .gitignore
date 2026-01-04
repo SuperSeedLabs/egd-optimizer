@@ -205,6 +205,3 @@ wandb/
 
 # Exclude babylm model experiment folders
 babylm_model_experiment_seed*/
-
-# ignore the _debug files
-*_debug*
